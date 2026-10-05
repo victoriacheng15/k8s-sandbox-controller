@@ -1,0 +1,3 @@
+[tools]
+kubebuilder = "latest"
+golangci-lint = "latest"
