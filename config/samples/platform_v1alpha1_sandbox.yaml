@@ -1,0 +1,12 @@
+
+apiVersion: platform.sandbox.dev/v1alpha1
+kind: Sandbox
+metadata:
+  labels:
+    app.kubernetes.io/name: k8s-sandbox-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: sandbox-sample
+spec:
+  ttlDuration: 4h
+  resourceTier: Small
+  networkIsolation: true
