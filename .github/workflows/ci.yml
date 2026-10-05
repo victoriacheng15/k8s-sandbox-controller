@@ -1,4 +1,4 @@
-name: E2E Tests
+name: CI
 
 on:
   push:
@@ -15,7 +15,7 @@ jobs:
     name: Check Changed Paths
     runs-on: ubuntu-latest
     outputs:
-      e2e: ${{ steps.filter.outputs.e2e }}
+      code: ${{ steps.filter.outputs.code }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -27,22 +27,22 @@ jobs:
         uses: dorny/paths-filter@v4
         with:
           filters: |
-            e2e:
+            code:
               - '**.go'
               - 'go.mod'
               - 'go.sum'
               - 'Makefile'
-              - 'Dockerfile'
-              - 'test/e2e/**'
+              - '.golangci.yml'
+              - '.custom-gcl.yml'
               - 'config/**'
 
-  test-e2e:
-    name: Run on Ubuntu
+  validate:
+    name: Lint & Test
     needs: filter
-    if: ${{ needs.filter.outputs.e2e == 'true' }}
+    if: ${{ needs.filter.outputs.code == 'true' }}
     runs-on: ubuntu-latest
     steps:
-      - name: Clone the code
+      - name: Checkout repository
         uses: actions/checkout@v7
         with:
           persist-credentials: false
@@ -53,16 +53,8 @@ jobs:
           go-version-file: go.mod
           cache: true
 
-      - name: Install the latest version of kind
-        run: |
-          curl -Lo ./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
+      - name: Run Linter
+        run: make lint
 
-      - name: Verify kind installation
-        run: kind version
-
-      - name: Running Test e2e
-        run: |
-          go mod tidy
-          make test-e2e
+      - name: Run Unit & Controller Tests
+        run: make test
