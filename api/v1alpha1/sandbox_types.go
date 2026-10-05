@@ -100,7 +100,7 @@ type SandboxStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type="string",JSONPath=".status.phase",description="Current lifecycle phase"
 // +kubebuilder:printcolumn:name="Namespace",type="string",JSONPath=".status.allocatedNamespace",description="Allocated sandbox namespace"
 // +kubebuilder:printcolumn:name="Tier",type="string",JSONPath=".spec.resourceTier",description="Resource quota tier"
-// +kubebuilder:printcolumn:name="Expires At",type="date",JSONPath=".status.expiresAt",description="Expiration timestamp"
+// +kubebuilder:printcolumn:name="Expires At",type="string",JSONPath=".status.expiresAt",description="Expiration timestamp"
 // +kubebuilder:printcolumn:name="Age",type="date",JSONPath=".metadata.creationTimestamp"
 
 // Sandbox is the Schema for the sandboxes API

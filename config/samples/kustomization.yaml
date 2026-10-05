@@ -1,4 +1,5 @@
 ## Append samples of your project ##
 resources:
 - platform_v1alpha1_sandbox.yaml
+- demo_webapp_sandbox.yaml
 # +kubebuilder:scaffold:manifestskustomizesamples

@@ -30,7 +30,7 @@ spec:
     - description: Expiration timestamp
       jsonPath: .status.expiresAt
       name: Expires At
-      type: date
+      type: string
     - jsonPath: .metadata.creationTimestamp
       name: Age
       type: date
