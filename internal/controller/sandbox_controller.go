@@ -19,6 +19,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
@@ -63,14 +64,50 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		return ctrl.Result{}, err
 	}
 
-	// Defer deletion handling to finalizer pipeline in Phase 4
+	// 1. Handle Deletion (if DeletionTimestamp is set)
 	if !sandbox.DeletionTimestamp.IsZero() {
+		return r.handleDeletion(ctx, sandbox)
+	}
+
+	// 2. Ensure Finalizer
+	added, err := r.ensureFinalizer(ctx, sandbox)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("ensuring finalizer: %w", err)
+	}
+	if added {
+		return ctrl.Result{}, nil
+	}
+
+	// 3. Initialize status.ExpiresAt if not set
+	if sandbox.Status.ExpiresAt == nil {
+		sandbox.Status.ExpiresAt = CalculateExpiresAt(sandbox, time.Now())
+		if sandbox.Status.Phase == "" {
+			sandbox.Status.Phase = platformv1alpha1.SandboxPhasePending
+		}
+		if err := r.updateStatus(ctx, sandbox); err != nil {
+			return ctrl.Result{}, fmt.Errorf("initializing status: %w", err)
+		}
+	}
+
+	// 4. Check TTL Expiration
+	now := time.Now()
+	if IsExpired(sandbox, now) {
+		log.Info("Sandbox TTL expired, tearing down child resources", "sandbox", sandbox.Name)
+		return r.handleExpiration(ctx, sandbox)
+	}
+
+	// 5. If already in Expired phase, do not reprovision child resources
+	if sandbox.Status.Phase == platformv1alpha1.SandboxPhaseExpired {
 		return ctrl.Result{}, nil
 	}
 
 	nsName := NamespaceName(sandbox)
 
-	// 1. Reconcile Namespace
+	if sandbox.Status.Phase != platformv1alpha1.SandboxPhaseReady {
+		sandbox.Status.Phase = platformv1alpha1.SandboxPhaseProvisioning
+	}
+
+	// 6. Reconcile Namespace
 	if err := r.reconcileNamespace(ctx, sandbox); err != nil {
 		r.setCondition(sandbox, platformv1alpha1.ConditionTypeNamespaceReady, metav1.ConditionFalse, "NamespaceReconcileFailed", err.Error())
 		_ = r.updateStatus(ctx, sandbox)
@@ -78,14 +115,14 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	r.setCondition(sandbox, platformv1alpha1.ConditionTypeNamespaceReady, metav1.ConditionTrue, "NamespaceProvisioned", "Dedicated namespace exists and is labeled")
 
-	// 2. Reconcile ResourceQuota
+	// 7. Reconcile ResourceQuota
 	if err := r.reconcileResourceQuota(ctx, sandbox); err != nil {
 		r.setCondition(sandbox, platformv1alpha1.ConditionTypeResourcesReady, metav1.ConditionFalse, "QuotaReconcileFailed", err.Error())
 		_ = r.updateStatus(ctx, sandbox)
 		return ctrl.Result{}, fmt.Errorf("reconciling resource quota: %w", err)
 	}
 
-	// 3. Reconcile LimitRange
+	// 8. Reconcile LimitRange
 	if err := r.reconcileLimitRange(ctx, sandbox); err != nil {
 		r.setCondition(sandbox, platformv1alpha1.ConditionTypeResourcesReady, metav1.ConditionFalse, "LimitRangeReconcileFailed", err.Error())
 		_ = r.updateStatus(ctx, sandbox)
@@ -93,7 +130,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	}
 	r.setCondition(sandbox, platformv1alpha1.ConditionTypeResourcesReady, metav1.ConditionTrue, "ResourcesEnforced", "ResourceQuota and LimitRange configured")
 
-	// 4. Reconcile NetworkPolicy
+	// 9. Reconcile NetworkPolicy
 	if err := r.reconcileNetworkPolicy(ctx, sandbox); err != nil {
 		r.setCondition(sandbox, platformv1alpha1.ConditionTypeNetworkReady, metav1.ConditionFalse, "NetworkPolicyReconcileFailed", err.Error())
 		_ = r.updateStatus(ctx, sandbox)
@@ -105,7 +142,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 		r.setCondition(sandbox, platformv1alpha1.ConditionTypeNetworkReady, metav1.ConditionTrue, "NetworkIsolationDisabled", "Network isolation is disabled")
 	}
 
-	// 5. Aggregate Status & Phase
+	// 10. Aggregate Status & Phase
 	r.setCondition(sandbox, platformv1alpha1.ConditionTypeReady, metav1.ConditionTrue, "AllResourcesReady", "Sandbox environment is fully provisioned")
 	sandbox.Status.Phase = platformv1alpha1.SandboxPhaseReady
 	sandbox.Status.AllocatedNamespace = nsName
@@ -113,6 +150,36 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.updateStatus(ctx, sandbox); err != nil {
 		log.Error(err, "Failed to update Sandbox status")
 		return ctrl.Result{}, err
+	}
+
+	// 11. Schedule Requeue for remaining TTL
+	remaining := RemainingTTL(sandbox, time.Now())
+	return ctrl.Result{RequeueAfter: remaining}, nil
+}
+
+func (r *SandboxReconciler) handleExpiration(ctx context.Context, sandbox *platformv1alpha1.Sandbox) (ctrl.Result, error) {
+	log := logf.FromContext(ctx)
+
+	r.setCondition(sandbox, platformv1alpha1.ConditionTypeExpired, metav1.ConditionTrue, "TTLExpired", "Sandbox TTL has expired and child resources are cleaned up")
+	r.setCondition(sandbox, platformv1alpha1.ConditionTypeReady, metav1.ConditionFalse, "SandboxExpired", "Sandbox environment is expired")
+	sandbox.Status.Phase = platformv1alpha1.SandboxPhaseExpired
+
+	nsName := NamespaceName(sandbox)
+	ns := &corev1.Namespace{}
+	err := r.Get(ctx, client.ObjectKey{Name: nsName}, ns)
+	if err == nil {
+		if ns.DeletionTimestamp.IsZero() {
+			if err := r.Delete(ctx, ns); err != nil && !apierrors.IsNotFound(err) {
+				return ctrl.Result{}, fmt.Errorf("deleting expired child namespace %s: %w", nsName, err)
+			}
+			log.Info("Deleted child namespace for expired sandbox", "sandbox", sandbox.Name, "namespace", nsName)
+		}
+	} else if !apierrors.IsNotFound(err) {
+		return ctrl.Result{}, fmt.Errorf("fetching child namespace %s: %w", nsName, err)
+	}
+
+	if err := r.updateStatus(ctx, sandbox); err != nil {
+		return ctrl.Result{}, fmt.Errorf("updating expired sandbox status: %w", err)
 	}
 
 	return ctrl.Result{}, nil
@@ -127,6 +194,9 @@ func (r *SandboxReconciler) reconcileNamespace(ctx context.Context, sandbox *pla
 	}
 	if err != nil {
 		return err
+	}
+	if !existing.DeletionTimestamp.IsZero() {
+		return fmt.Errorf("child namespace %s is currently terminating", desired.Name)
 	}
 
 	// Ensure required managed labels exist

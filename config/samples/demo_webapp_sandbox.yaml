@@ -1,0 +1,11 @@
+apiVersion: platform.sandbox.dev/v1alpha1
+kind: Sandbox
+metadata:
+  labels:
+    app.kubernetes.io/name: k8s-sandbox-controller
+    app.kubernetes.io/managed-by: kustomize
+  name: demo-webapp
+spec:
+  ttlDuration: 2h
+  resourceTier: Medium
+  networkIsolation: true
