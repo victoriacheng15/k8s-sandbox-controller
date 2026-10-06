@@ -29,11 +29,9 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
-	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
-	"sigs.k8s.io/controller-runtime/pkg/predicate"
 
 	platformv1alpha1 "github.com/victoriacheng15/k8s-sandbox-controller/api/v1alpha1"
 )
@@ -304,7 +302,7 @@ func (r *SandboxReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	}
 
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&platformv1alpha1.Sandbox{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
+		For(&platformv1alpha1.Sandbox{}).
 		Watches(&corev1.Namespace{}, handler.EnqueueRequestsFromMapFunc(mapChildToSandbox)).
 		Watches(&corev1.ResourceQuota{}, handler.EnqueueRequestsFromMapFunc(mapChildToSandbox)).
 		Watches(&corev1.LimitRange{}, handler.EnqueueRequestsFromMapFunc(mapChildToSandbox)).
