@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -27,8 +28,18 @@ func (r *SandboxReconciler) ensureFinalizer(ctx context.Context, sandbox *platfo
 		return false, nil
 	}
 
-	controllerutil.AddFinalizer(sandbox, SandboxCleanupFinalizer)
-	if err := r.Update(ctx, sandbox); err != nil {
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &platformv1alpha1.Sandbox{}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), latest); err != nil {
+			return err
+		}
+		if controllerutil.ContainsFinalizer(latest, SandboxCleanupFinalizer) {
+			return nil
+		}
+		controllerutil.AddFinalizer(latest, SandboxCleanupFinalizer)
+		return r.Update(ctx, latest)
+	})
+	if err != nil {
 		return false, err
 	}
 	return true, nil
@@ -57,8 +68,18 @@ func (r *SandboxReconciler) handleDeletion(ctx context.Context, sandbox *platfor
 	if err != nil {
 		if apierrors.IsNotFound(err) {
 			// Child namespace is deleted, safe to release finalizer
-			controllerutil.RemoveFinalizer(sandbox, SandboxCleanupFinalizer)
-			if err := r.Update(ctx, sandbox); err != nil {
+			err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+				latest := &platformv1alpha1.Sandbox{}
+				if err := r.Get(ctx, client.ObjectKeyFromObject(sandbox), latest); err != nil {
+					return client.IgnoreNotFound(err)
+				}
+				if !controllerutil.ContainsFinalizer(latest, SandboxCleanupFinalizer) {
+					return nil
+				}
+				controllerutil.RemoveFinalizer(latest, SandboxCleanupFinalizer)
+				return r.Update(ctx, latest)
+			})
+			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("removing finalizer: %w", err)
 			}
 			log.Info("Child namespace removed, released finalizer", "sandbox", sandbox.Name, "namespace", nsName)
