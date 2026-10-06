@@ -86,9 +86,30 @@ setup-test-e2e: ## Set up a Kind cluster for e2e tests if it does not exist
 	esac
 
 .PHONY: test-e2e
-test-e2e: setup-test-e2e manifests generate fmt vet ## Run the e2e tests. Expected an isolated environment using Kind.
-	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v -ginkgo.v
-	$(MAKE) cleanup-test-e2e
+test-e2e: manifests generate fmt vet ## Run the e2e tests. Uses Kind by default, or set USE_EXISTING_CLUSTER=true for existing clusters (e.g. k3s).
+ifeq ($(USE_EXISTING_CLUSTER),true)
+	$(MAKE) install
+	@"$(KUBECTL)" apply -k config/admission
+	@go run ./cmd/main.go & PID=$$!; \
+	trap 'kill $$PID 2>/dev/null || true' EXIT INT TERM; \
+	sleep 3; \
+	go test -tags=e2e ./test/e2e/ -v; \
+	EXIT_CODE=$$?; \
+	kill $$PID 2>/dev/null || true; \
+	exit $$EXIT_CODE
+else
+	$(MAKE) setup-test-e2e
+	$(MAKE) install
+	@"$(KUBECTL)" apply -k config/admission
+	@go run ./cmd/main.go & PID=$$!; \
+	trap 'kill $$PID 2>/dev/null || true' EXIT INT TERM; \
+	sleep 3; \
+	KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) go test -tags=e2e ./test/e2e/ -v; \
+	EXIT_CODE=$$?; \
+	kill $$PID 2>/dev/null || true; \
+	$(MAKE) cleanup-test-e2e; \
+	exit $$EXIT_CODE
+endif
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests

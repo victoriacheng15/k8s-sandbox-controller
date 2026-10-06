@@ -20,320 +20,442 @@ limitations under the License.
 package e2e
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
-	"os"
-	"os/exec"
-	"path/filepath"
+	"strings"
 	"time"
 
-	. "github.com/onsi/ginkgo/v2"
-	. "github.com/onsi/gomega"
+	"github.com/cucumber/godog"
+	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/kubernetes/scheme"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/victoriacheng15/k8s-sandbox-controller/test/utils"
+	platformv1alpha1 "github.com/victoriacheng15/k8s-sandbox-controller/api/v1alpha1"
 )
 
-// namespace where the project is deployed in
-const namespace = "k8s-sandbox-controller-system"
+type scenarioState struct {
+	client          client.Client
+	ctx             context.Context
+	lastErr         error
+	lastSandboxName string
+	runID           string
+}
 
-// serviceAccountName created for the project
-const serviceAccountName = "k8s-sandbox-controller-controller-manager"
+func (s *scenarioState) resolve(name string) string {
+	if s.runID == "" {
+		return name
+	}
+	// Preserve well-known resource names inside the namespace (e.g., sbx-quota, sbx-limits, sbx-isolation)
+	if name == "sbx-quota" || name == "sbx-limits" || name == "sbx-isolation" {
+		return name
+	}
+	if strings.HasPrefix(name, "sbx-") {
+		base := strings.TrimPrefix(name, "sbx-")
+		return "sbx-" + base + "-" + s.runID
+	}
+	return name + "-" + s.runID
+}
 
-// metricsServiceName is the name of the metrics service of the project
-const metricsServiceName = "k8s-sandbox-controller-controller-manager-metrics-service"
-
-// metricsRoleBindingName is the name of the RBAC that will be created to allow get the metrics data
-const metricsRoleBindingName = "k8s-sandbox-controller-metrics-binding"
-
-var _ = Describe("Manager", Ordered, func() {
-	var controllerPodName string
-
-	// Before running the tests, set up the environment by creating the namespace,
-	// enforce the restricted security policy to the namespace, installing CRDs,
-	// and deploying the controller.
-	BeforeAll(func() {
-		By("creating manager namespace")
-		cmd := exec.Command("kubectl", "create", "ns", namespace)
-		_, err := utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to create namespace")
-
-		By("labeling the namespace to enforce the restricted security policy")
-		cmd = exec.Command("kubectl", "label", "--overwrite", "ns", namespace,
-			"pod-security.kubernetes.io/enforce=restricted")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to label namespace with restricted policy")
-
-		By("installing CRDs")
-		cmd = exec.Command("make", "install")
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to install CRDs")
-
-		By("deploying the controller-manager")
-		cmd = exec.Command("make", "deploy", fmt.Sprintf("IMG=%s", managerImage))
-		_, err = utils.Run(cmd)
-		Expect(err).NotTo(HaveOccurred(), "Failed to deploy the controller-manager")
-	})
-
-	// After all tests have been executed, clean up by undeploying the controller, uninstalling CRDs,
-	// and deleting the namespace.
-	AfterAll(func() {
-		By("cleaning up the curl pod for metrics")
-		cmd := exec.Command("kubectl", "delete", "pod", "curl-metrics", "-n", namespace)
-		_, _ = utils.Run(cmd)
-
-		By("undeploying the controller-manager")
-		cmd = exec.Command("make", "undeploy")
-		_, _ = utils.Run(cmd)
-
-		By("uninstalling CRDs")
-		cmd = exec.Command("make", "uninstall")
-		_, _ = utils.Run(cmd)
-
-		By("removing manager namespace")
-		cmd = exec.Command("kubectl", "delete", "ns", namespace)
-		_, _ = utils.Run(cmd)
-	})
-
-	// After each test, check for failures and collect logs, events,
-	// and pod descriptions for debugging.
-	AfterEach(func() {
-		specReport := CurrentSpecReport()
-		if specReport.Failed() {
-			By("Fetching controller manager pod logs")
-			cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-			controllerLogs, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Controller logs:\n %s", controllerLogs)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Controller logs: %s", err)
-			}
-
-			By("Fetching Kubernetes events")
-			cmd = exec.Command("kubectl", "get", "events", "-n", namespace, "--sort-by=.lastTimestamp")
-			eventsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Kubernetes events:\n%s", eventsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get Kubernetes events: %s", err)
-			}
-
-			By("Fetching curl-metrics logs")
-			cmd = exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-			metricsOutput, err := utils.Run(cmd)
-			if err == nil {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Metrics logs:\n %s", metricsOutput)
-			} else {
-				_, _ = fmt.Fprintf(GinkgoWriter, "Failed to get curl-metrics logs: %s", err)
-			}
-
-			By("Fetching controller manager pod description")
-			cmd = exec.Command("kubectl", "describe", "pod", controllerPodName, "-n", namespace)
-			podDescription, err := utils.Run(cmd)
-			if err == nil {
-				fmt.Println("Pod description:\n", podDescription)
-			} else {
-				fmt.Println("Failed to describe controller pod")
-			}
-		}
-	})
-
-	SetDefaultEventuallyTimeout(2 * time.Minute)
-	SetDefaultEventuallyPollingInterval(time.Second)
-
-	Context("Manager", func() {
-		It("should run successfully", func() {
-			By("validating that the controller-manager pod is running as expected")
-			verifyControllerUp := func(g Gomega) {
-				By("getting the name of the controller-manager pod")
-				cmd := exec.Command("kubectl", "get",
-					"pods", "-l", "control-plane=controller-manager",
-					"-o", "go-template={{ range .items }}"+
-						"{{ if not .metadata.deletionTimestamp }}"+
-						"{{ .metadata.name }}"+
-						"{{ \"\\n\" }}{{ end }}{{ end }}",
-					"-n", namespace,
-				)
-
-				podOutput, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve controller-manager pod information")
-				podNames := utils.GetNonEmptyLines(podOutput)
-				g.Expect(podNames).To(HaveLen(1), "expected 1 controller pod running")
-				controllerPodName = podNames[0]
-				g.Expect(controllerPodName).To(ContainSubstring("controller-manager"))
-
-				By("validating the pod's status")
-				cmd = exec.Command("kubectl", "get",
-					"pods", controllerPodName, "-o", "jsonpath={.status.phase}",
-					"-n", namespace,
-				)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Running"), "Incorrect controller-manager pod status")
-			}
-			Eventually(verifyControllerUp).Should(Succeed())
-		})
-
-		It("should ensure the metrics endpoint is serving metrics", func() {
-			By("creating a ClusterRoleBinding for the service account to allow access to metrics")
-			cmd := exec.Command("kubectl", "create", "clusterrolebinding", metricsRoleBindingName,
-				"--clusterrole=k8s-sandbox-controller-metrics-reader",
-				fmt.Sprintf("--serviceaccount=%s:%s", namespace, serviceAccountName),
-			)
-			_, err := utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create ClusterRoleBinding")
-
-			By("validating that the metrics service is available")
-			cmd = exec.Command("kubectl", "get", "service", metricsServiceName, "-n", namespace)
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Metrics service should exist")
-
-			By("getting the service account token")
-			token, err := serviceAccountToken()
-			Expect(err).NotTo(HaveOccurred())
-			Expect(token).NotTo(BeEmpty())
-
-			By("ensuring the controller pod is ready")
-			verifyControllerPodReady := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pod", controllerPodName, "-n", namespace,
-					"-o", "jsonpath={.status.conditions[?(@.type=='Ready')].status}")
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("True"), "Controller pod not ready")
-			}
-			Eventually(verifyControllerPodReady, 3*time.Minute, time.Second).Should(Succeed())
-
-			By("verifying that the controller manager is serving the metrics server")
-			verifyMetricsServerStarted := func(g Gomega) {
-				cmd := exec.Command("kubectl", "logs", controllerPodName, "-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(ContainSubstring("Serving metrics server"),
-					"Metrics server not yet started")
-			}
-			Eventually(verifyMetricsServerStarted, 3*time.Minute, time.Second).Should(Succeed())
-
-			// +kubebuilder:scaffold:e2e-metrics-webhooks-readiness
-
-			By("creating the curl-metrics pod to access the metrics endpoint")
-			cmd = exec.Command("kubectl", "run", "curl-metrics", "--restart=Never",
-				"--namespace", namespace,
-				"--image=curlimages/curl:latest",
-				"--overrides",
-				fmt.Sprintf(`{
-					"spec": {
-						"containers": [{
-							"name": "curl",
-							"image": "curlimages/curl:latest",
-							"command": ["/bin/sh", "-c"],
-							"args": [
-								"for i in $(seq 1 30); do curl -v -k -H 'Authorization: Bearer %s' https://%s.%s.svc.cluster.local:8443/metrics && exit 0 || sleep 2; done; exit 1"
-							],
-							"securityContext": {
-								"readOnlyRootFilesystem": true,
-								"allowPrivilegeEscalation": false,
-								"capabilities": {
-									"drop": ["ALL"]
-								},
-								"runAsNonRoot": true,
-								"runAsUser": 1000,
-								"seccompProfile": {
-									"type": "RuntimeDefault"
-								}
-							}
-						}],
-						"serviceAccountName": "%s"
-					}
-				}`, token, metricsServiceName, namespace, serviceAccountName))
-			_, err = utils.Run(cmd)
-			Expect(err).NotTo(HaveOccurred(), "Failed to create curl-metrics pod")
-
-			By("waiting for the curl-metrics pod to complete.")
-			verifyCurlUp := func(g Gomega) {
-				cmd := exec.Command("kubectl", "get", "pods", "curl-metrics",
-					"-o", "jsonpath={.status.phase}",
-					"-n", namespace)
-				output, err := utils.Run(cmd)
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(output).To(Equal("Succeeded"), "curl pod in wrong status")
-			}
-			Eventually(verifyCurlUp, 5*time.Minute).Should(Succeed())
-
-			By("getting the metrics by checking curl-metrics logs")
-			verifyMetricsAvailable := func(g Gomega) {
-				metricsOutput, err := getMetricsOutput()
-				g.Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-				g.Expect(metricsOutput).NotTo(BeEmpty())
-				g.Expect(metricsOutput).To(ContainSubstring("< HTTP/1.1 200 OK"))
-			}
-			Eventually(verifyMetricsAvailable, 2*time.Minute).Should(Succeed())
-		})
-
-		// +kubebuilder:scaffold:e2e-webhooks-checks
-
-		// TODO: Customize the e2e test suite with scenarios specific to your project.
-		// Consider applying sample/CR(s) and check their status and/or verifying
-		// the reconciliation by using the metrics, i.e.:
-		// metricsOutput, err := getMetricsOutput()
-		// Expect(err).NotTo(HaveOccurred(), "Failed to retrieve logs from curl pod")
-		// Expect(metricsOutput).To(ContainSubstring(
-		//    fmt.Sprintf(`controller_runtime_reconcile_total{controller="%s",result="success"} 1`,
-		//    strings.ToLower(<Kind>),
-		// ))
-	})
-})
-
-// serviceAccountToken returns a token for the specified service account in the given namespace.
-// It uses the Kubernetes TokenRequest API to generate a token by directly sending a request
-// and parsing the resulting token from the API response.
-func serviceAccountToken() (string, error) {
-	const tokenRequestRawString = `{
-		"apiVersion": "authentication.k8s.io/v1",
-		"kind": "TokenRequest"
-	}`
-
-	By("creating temporary file to store the token request")
-	secretName := fmt.Sprintf("%s-token-request", serviceAccountName)
-	tokenRequestFile := filepath.Join("/tmp", secretName)
-	err := os.WriteFile(tokenRequestFile, []byte(tokenRequestRawString), os.FileMode(0o644))
+func getClient() (client.Client, error) {
+	cfg, err := ctrl.GetConfig()
 	if err != nil {
-		return "", err
+		return nil, fmt.Errorf("failed to get kubeconfig: %w", err)
 	}
-
-	var out string
-	verifyTokenCreation := func(g Gomega) {
-		By("executing kubectl command to create the token")
-		cmd := exec.Command("kubectl", "create", "--raw", fmt.Sprintf(
-			"/api/v1/namespaces/%s/serviceaccounts/%s/token",
-			namespace,
-			serviceAccountName,
-		), "-f", tokenRequestFile)
-
-		output, err := cmd.CombinedOutput()
-		g.Expect(err).NotTo(HaveOccurred())
-
-		By("parsing the JSON output to extract the token")
-		var token tokenRequest
-		err = json.Unmarshal(output, &token)
-		g.Expect(err).NotTo(HaveOccurred())
-
-		out = token.Status.Token
-	}
-	Eventually(verifyTokenCreation).Should(Succeed())
-
-	return out, err
+	s := runtime.NewScheme()
+	_ = scheme.AddToScheme(s)
+	_ = platformv1alpha1.AddToScheme(s)
+	_ = corev1.AddToScheme(s)
+	_ = networkingv1.AddToScheme(s)
+	return client.New(cfg, client.Options{Scheme: s})
 }
 
-// getMetricsOutput retrieves and returns the logs from the curl pod used to access the metrics endpoint.
-func getMetricsOutput() (string, error) {
-	By("getting the curl-metrics logs")
-	cmd := exec.Command("kubectl", "logs", "curl-metrics", "-n", namespace)
-	return utils.Run(cmd)
+func eventually(timeout, interval time.Duration, condition func() (bool, error)) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		ok, err := condition()
+		if err != nil {
+			return err
+		}
+		if ok {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timed out after %v waiting for condition", timeout)
+		}
+		time.Sleep(interval)
+	}
 }
 
-// tokenRequest is a simplified representation of the Kubernetes TokenRequest API response,
-// containing only the token field that we need to extract.
-type tokenRequest struct {
-	Status struct {
-		Token string `json:"token"`
-	} `json:"status"`
+// InitializeScenario registers all Gherkin step bindings with Godog.
+func InitializeScenario(ctx *godog.ScenarioContext) {
+	s := &scenarioState{
+		ctx: context.Background(),
+	}
+
+	ctx.Before(func(ctx context.Context, sc *godog.Scenario) (context.Context, error) {
+		cl, err := getClient()
+		if err != nil {
+			return ctx, err
+		}
+		s.client = cl
+		s.lastErr = nil
+		s.runID = fmt.Sprintf("%x", time.Now().UnixNano()%0xfffff)
+		return ctx, nil
+	})
+
+	ctx.After(func(ctx context.Context, sc *godog.Scenario, err error) (context.Context, error) {
+		if s.lastSandboxName != "" && s.client != nil {
+			var sbx platformv1alpha1.Sandbox
+			sbx.Name = s.lastSandboxName
+			_ = client.IgnoreNotFound(s.client.Delete(s.ctx, &sbx))
+		}
+		return ctx, nil
+	})
+
+	ctx.Step(`^a Kubernetes cluster is running$`, s.aKubernetesClusterIsRunning)
+	ctx.Step(`^I create a Sandbox named "([^"]*)" with tier "([^"]*)" and network isolation enabled$`, s.iCreateASandboxNamedWithTierAndNetworkIsolationEnabled)
+	ctx.Step(`^the Sandbox phase should transition to "([^"]*)"$`, s.theSandboxPhaseShouldTransitionTo)
+	ctx.Step(`^the child namespace "([^"]*)" should exist with label "([^"]*)" set to "([^"]*)"$`, s.theChildNamespaceShouldExistWithLabelSetTo)
+	ctx.Step(`^a ResourceQuota named "([^"]*)" should exist in namespace "([^"]*)"$`, s.aResourceQuotaNamedShouldExistInNamespace)
+	ctx.Step(`^a LimitRange named "([^"]*)" should exist in namespace "([^"]*)"$`, s.aLimitRangeNamedShouldExistInNamespace)
+	ctx.Step(`^a NetworkPolicy named "([^"]*)" should exist in namespace "([^"]*)"$`, s.aNetworkPolicyNamedShouldExistInNamespace)
+	ctx.Step(`^a Sandbox named "([^"]*)" exists and is "([^"]*)"$`, s.aSandboxNamedExistsAndIs)
+	ctx.Step(`^the ResourceQuota named "([^"]*)" in namespace "([^"]*)" is deleted$`, s.theResourceQuotaNamedInNamespaceIsDeleted)
+	ctx.Step(`^the controller should heal the drift and recreate "([^"]*)" in namespace "([^"]*)"$`, s.theControllerShouldHealTheDriftAndRecreateInNamespace)
+	ctx.Step(`^I create an ephemeral Sandbox named "([^"]*)" with TTL duration "([^"]*)"$`, s.iCreateAnEphemeralSandboxNamedWithTTLDuration)
+	ctx.Step(`^the Sandbox phase should eventually transition to "([^"]*)"$`, s.theSandboxPhaseShouldEventuallyTransitionTo)
+	ctx.Step(`^the child namespace "([^"]*)" should eventually be terminated$`, s.theChildNamespaceShouldEventuallyBeTerminated)
+	ctx.Step(`^I delete the Sandbox named "([^"]*)"$`, s.iDeleteTheSandboxNamed)
+	ctx.Step(`^the Sandbox named "([^"]*)" should be completely removed$`, s.theSandboxNamedShouldBeCompletelyRemoved)
+	ctx.Step(`^I disable network isolation on Sandbox "([^"]*)"$`, s.iDisableNetworkIsolationOnSandbox)
+	ctx.Step(`^the NetworkPolicy named "([^"]*)" in namespace "([^"]*)" should be removed$`, s.theNetworkPolicyNamedInNamespaceShouldBeRemoved)
+	ctx.Step(`^I attempt to create a Pod named "([^"]*)" in namespace "([^"]*)" with image "([^"]*)"$`, s.iAttemptToCreateAPodNamedInNamespaceWithImage)
+	ctx.Step(`^the Pod creation should be rejected with message "([^"]*)"$`, s.thePodCreationShouldBeRejectedWithMessage)
+	ctx.Step(`^I create a compliant Pod named "([^"]*)" in namespace "([^"]*)"$`, s.iCreateACompliantPodNamedInNamespace)
+	ctx.Step(`^the Pod named "([^"]*)" in namespace "([^"]*)" should exist$`, s.thePodNamedInNamespaceShouldExist)
+	ctx.Step(`^an unmanaged namespace named "([^"]*)" exists$`, s.anUnmanagedNamespaceNamedExists)
+}
+
+func (s *scenarioState) aKubernetesClusterIsRunning() error {
+	if s.client == nil {
+		return fmt.Errorf("kubernetes client is not initialized")
+	}
+	var nsList corev1.NamespaceList
+	return s.client.List(s.ctx, &nsList, client.Limit(1))
+}
+
+func (s *scenarioState) iCreateASandboxNamedWithTierAndNetworkIsolationEnabled(name, tier string) error {
+	name = s.resolve(name)
+	s.lastSandboxName = name
+	var resTier platformv1alpha1.ResourceTier
+	switch strings.ToLower(tier) {
+	case "medium":
+		resTier = platformv1alpha1.ResourceTierMedium
+	case "large":
+		resTier = platformv1alpha1.ResourceTierLarge
+	default:
+		resTier = platformv1alpha1.ResourceTierSmall
+	}
+	sbx := &platformv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: platformv1alpha1.SandboxSpec{
+			TtlDuration:      metav1.Duration{Duration: 2 * time.Hour},
+			ResourceTier:     resTier,
+			NetworkIsolation: true,
+		},
+	}
+	err := s.client.Create(s.ctx, sbx)
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
+}
+
+func (s *scenarioState) theSandboxPhaseShouldTransitionTo(expectedPhase string) error {
+	return eventually(45*time.Second, time.Second, func() (bool, error) {
+		var sbx platformv1alpha1.Sandbox
+		if err := s.client.Get(s.ctx, types.NamespacedName{Name: s.lastSandboxName}, &sbx); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return string(sbx.Status.Phase) == expectedPhase, nil
+	})
+}
+
+func (s *scenarioState) theChildNamespaceShouldExistWithLabelSetTo(nsName, labelKey, labelVal string) error {
+	nsName = s.resolve(nsName)
+	return eventually(30*time.Second, time.Second, func() (bool, error) {
+		var ns corev1.Namespace
+		if err := s.client.Get(s.ctx, types.NamespacedName{Name: nsName}, &ns); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return ns.Labels[labelKey] == labelVal, nil
+	})
+}
+
+func (s *scenarioState) aResourceQuotaNamedShouldExistInNamespace(quotaName, nsName string) error {
+	nsName = s.resolve(nsName)
+	return eventually(30*time.Second, time.Second, func() (bool, error) {
+		var rq corev1.ResourceQuota
+		if err := s.client.Get(s.ctx, types.NamespacedName{Name: quotaName, Namespace: nsName}, &rq); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+}
+
+func (s *scenarioState) aLimitRangeNamedShouldExistInNamespace(lrName, nsName string) error {
+	nsName = s.resolve(nsName)
+	return eventually(30*time.Second, time.Second, func() (bool, error) {
+		var lr corev1.LimitRange
+		if err := s.client.Get(s.ctx, types.NamespacedName{Name: lrName, Namespace: nsName}, &lr); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+}
+
+func (s *scenarioState) aNetworkPolicyNamedShouldExistInNamespace(npName, nsName string) error {
+	nsName = s.resolve(nsName)
+	return eventually(30*time.Second, time.Second, func() (bool, error) {
+		var np networkingv1.NetworkPolicy
+		if err := s.client.Get(s.ctx, types.NamespacedName{Name: npName, Namespace: nsName}, &np); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+}
+
+func (s *scenarioState) aSandboxNamedExistsAndIs(name, phase string) error {
+	name = s.resolve(name)
+	s.lastSandboxName = name
+	var sbx platformv1alpha1.Sandbox
+	err := s.client.Get(s.ctx, types.NamespacedName{Name: name}, &sbx)
+	if apierrors.IsNotFound(err) {
+		sbx = platformv1alpha1.Sandbox{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: platformv1alpha1.SandboxSpec{
+				TtlDuration:      metav1.Duration{Duration: 2 * time.Hour},
+				ResourceTier:     platformv1alpha1.ResourceTierSmall,
+				NetworkIsolation: true,
+			},
+		}
+		if createErr := s.client.Create(s.ctx, &sbx); createErr != nil {
+			return createErr
+		}
+	} else if err != nil {
+		return err
+	}
+	return s.theSandboxPhaseShouldTransitionTo(phase)
+}
+
+func (s *scenarioState) theResourceQuotaNamedInNamespaceIsDeleted(quotaName, nsName string) error {
+	var rq corev1.ResourceQuota
+	rq.Name = quotaName
+	rq.Namespace = nsName
+	return client.IgnoreNotFound(s.client.Delete(s.ctx, &rq))
+}
+
+func (s *scenarioState) theControllerShouldHealTheDriftAndRecreateInNamespace(quotaName, nsName string) error {
+	return s.aResourceQuotaNamedShouldExistInNamespace(quotaName, nsName)
+}
+
+func (s *scenarioState) iCreateAnEphemeralSandboxNamedWithTTLDuration(name, ttlStr string) error {
+	name = s.resolve(name)
+	d, err := time.ParseDuration(ttlStr)
+	if err != nil {
+		return fmt.Errorf("invalid ttl duration %q: %w", ttlStr, err)
+	}
+	s.lastSandboxName = name
+	sbx := &platformv1alpha1.Sandbox{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: name,
+		},
+		Spec: platformv1alpha1.SandboxSpec{
+			TtlDuration:      metav1.Duration{Duration: d},
+			ResourceTier:     platformv1alpha1.ResourceTierSmall,
+			NetworkIsolation: true,
+		},
+	}
+	return s.client.Create(s.ctx, sbx)
+}
+
+func (s *scenarioState) theSandboxPhaseShouldEventuallyTransitionTo(expectedPhase string) error {
+	return s.theSandboxPhaseShouldTransitionTo(expectedPhase)
+}
+
+func (s *scenarioState) theChildNamespaceShouldEventuallyBeTerminated(nsName string) error {
+	nsName = s.resolve(nsName)
+	return eventually(45*time.Second, time.Second, func() (bool, error) {
+		var ns corev1.Namespace
+		err := s.client.Get(s.ctx, types.NamespacedName{Name: nsName}, &ns)
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		if err != nil {
+			return false, err
+		}
+		return ns.DeletionTimestamp != nil, nil
+	})
+}
+
+func (s *scenarioState) iDeleteTheSandboxNamed(name string) error {
+	name = s.resolve(name)
+	var sbx platformv1alpha1.Sandbox
+	sbx.Name = name
+	return client.IgnoreNotFound(s.client.Delete(s.ctx, &sbx))
+}
+
+func (s *scenarioState) theSandboxNamedShouldBeCompletelyRemoved(name string) error {
+	name = s.resolve(name)
+	return eventually(45*time.Second, time.Second, func() (bool, error) {
+		var sbx platformv1alpha1.Sandbox
+		err := s.client.Get(s.ctx, types.NamespacedName{Name: name}, &sbx)
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	})
+}
+
+func (s *scenarioState) iDisableNetworkIsolationOnSandbox(name string) error {
+	name = s.resolve(name)
+	var sbx platformv1alpha1.Sandbox
+	if err := s.client.Get(s.ctx, types.NamespacedName{Name: name}, &sbx); err != nil {
+		return err
+	}
+	sbx.Spec.NetworkIsolation = false
+	return s.client.Update(s.ctx, &sbx)
+}
+
+func (s *scenarioState) theNetworkPolicyNamedInNamespaceShouldBeRemoved(npName, nsName string) error {
+	nsName = s.resolve(nsName)
+	return eventually(30*time.Second, time.Second, func() (bool, error) {
+		var np networkingv1.NetworkPolicy
+		err := s.client.Get(s.ctx, types.NamespacedName{Name: npName, Namespace: nsName}, &np)
+		if apierrors.IsNotFound(err) {
+			return true, nil
+		}
+		return false, err
+	})
+}
+
+func (s *scenarioState) iAttemptToCreateAPodNamedInNamespaceWithImage(podName, nsName, image string) error {
+	nsName = s.resolve(nsName)
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: nsName,
+		},
+		Spec: corev1.PodSpec{
+			Containers: []corev1.Container{
+				{
+					Name:  "app",
+					Image: image,
+				},
+			},
+		},
+	}
+	s.lastErr = s.client.Create(s.ctx, pod)
+	return nil
+}
+
+func (s *scenarioState) thePodCreationShouldBeRejectedWithMessage(msg string) error {
+	if s.lastErr == nil {
+		return fmt.Errorf("expected pod creation to fail, but it succeeded")
+	}
+	if !strings.Contains(s.lastErr.Error(), msg) {
+		return fmt.Errorf("expected error containing %q, got: %v", msg, s.lastErr)
+	}
+	return nil
+}
+
+func (s *scenarioState) iCreateACompliantPodNamedInNamespace(podName, nsName string) error {
+	nsName = s.resolve(nsName)
+	nonRoot := true
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      podName,
+			Namespace: nsName,
+		},
+		Spec: corev1.PodSpec{
+			SecurityContext: &corev1.PodSecurityContext{
+				RunAsNonRoot: &nonRoot,
+			},
+			Containers: []corev1.Container{
+				{
+					Name:  "app",
+					Image: "nginx:1.27.1-alpine",
+					Resources: corev1.ResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("100m"),
+							corev1.ResourceMemory: resource.MustParse("64Mi"),
+						},
+						Limits: corev1.ResourceList{
+							corev1.ResourceCPU:    resource.MustParse("200m"),
+							corev1.ResourceMemory: resource.MustParse("128Mi"),
+						},
+					},
+					SecurityContext: &corev1.SecurityContext{
+						Capabilities: &corev1.Capabilities{
+							Drop: []corev1.Capability{"ALL"},
+						},
+					},
+				},
+			},
+		},
+	}
+	s.lastErr = s.client.Create(s.ctx, pod)
+	return s.lastErr
+}
+
+func (s *scenarioState) thePodNamedInNamespaceShouldExist(podName, nsName string) error {
+	nsName = s.resolve(nsName)
+	return eventually(30*time.Second, time.Second, func() (bool, error) {
+		var pod corev1.Pod
+		if err := s.client.Get(s.ctx, types.NamespacedName{Name: podName, Namespace: nsName}, &pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		return true, nil
+	})
+}
+
+func (s *scenarioState) anUnmanagedNamespaceNamedExists(nsName string) error {
+	nsName = s.resolve(nsName)
+	ns := &corev1.Namespace{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: nsName,
+		},
+	}
+	err := s.client.Create(s.ctx, ns)
+	if err != nil && !apierrors.IsAlreadyExists(err) {
+		return err
+	}
+	return nil
 }
