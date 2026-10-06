@@ -13,6 +13,8 @@ import (
 const (
 	// LabelManaged marks resources managed by the sandbox controller.
 	LabelManaged = "sandbox.dev/managed"
+	// LabelManagedValue is the standard value for LabelManaged on managed resources.
+	LabelManagedValue = "true"
 	// LabelSandboxName tracks the parent Sandbox resource name.
 	LabelSandboxName = "sandbox.dev/sandbox-name"
 
@@ -32,7 +34,7 @@ func NamespaceName(sandbox *platformv1alpha1.Sandbox) string {
 // CommonLabels returns standardized metadata labels for sandbox child resources.
 func CommonLabels(sandbox *platformv1alpha1.Sandbox) map[string]string {
 	return map[string]string{
-		LabelManaged:                   "true",
+		LabelManaged:                   LabelManagedValue,
 		LabelSandboxName:               sandbox.Name,
 		"app.kubernetes.io/managed-by": "k8s-sandbox-controller",
 	}
