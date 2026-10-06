@@ -34,6 +34,7 @@ import (
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
 	platformv1alpha1 "github.com/victoriacheng15/k8s-sandbox-controller/api/v1alpha1"
+	"github.com/victoriacheng15/k8s-sandbox-controller/internal/metrics"
 )
 
 // SandboxReconciler reconciles a Sandbox object
@@ -46,33 +47,52 @@ type SandboxReconciler struct {
 // +kubebuilder:rbac:groups=platform.sandbox.dev,resources=sandboxes/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=platform.sandbox.dev,resources=sandboxes/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=namespaces;resourcequotas;limitranges,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=get;list;watch;create;update;patch;delete
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
 func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
+	startTime := time.Now()
 
 	sandbox := &platformv1alpha1.Sandbox{}
 	if err := r.Get(ctx, req.NamespacedName, sandbox); err != nil {
 		if apierrors.IsNotFound(err) {
 			return ctrl.Result{}, nil
 		}
-		log.Error(err, "Failed to fetch Sandbox")
+		log.Error(err, "Failed to fetch Sandbox", "sandbox_name", req.Name)
+		metrics.SandboxReconcileTotal.WithLabelValues("unknown", "error").Inc()
 		return ctrl.Result{}, err
 	}
 
+	phase := string(sandbox.Status.Phase)
+	if phase == "" {
+		phase = string(platformv1alpha1.SandboxPhasePending)
+	}
+	defer func() {
+		metrics.SandboxReconcileDuration.WithLabelValues(phase).Observe(time.Since(startTime).Seconds())
+	}()
+
 	// 1. Handle Deletion (if DeletionTimestamp is set)
 	if !sandbox.DeletionTimestamp.IsZero() {
-		return r.handleDeletion(ctx, sandbox)
+		res, err := r.handleDeletion(ctx, sandbox)
+		if err != nil {
+			metrics.SandboxReconcileTotal.WithLabelValues(phase, "error").Inc()
+		} else {
+			metrics.SandboxReconcileTotal.WithLabelValues(phase, "success").Inc()
+		}
+		return res, err
 	}
 
 	// 2. Ensure Finalizer
 	added, err := r.ensureFinalizer(ctx, sandbox)
 	if err != nil {
+		metrics.SandboxReconcileTotal.WithLabelValues(phase, "error").Inc()
 		return ctrl.Result{}, fmt.Errorf("ensuring finalizer: %w", err)
 	}
 	if added {
+		metrics.SandboxReconcileTotal.WithLabelValues(phase, "success").Inc()
 		return ctrl.Result{}, nil
 	}
 
@@ -83,6 +103,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 			sandbox.Status.Phase = platformv1alpha1.SandboxPhasePending
 		}
 		if err := r.updateStatus(ctx, sandbox); err != nil {
+			metrics.SandboxReconcileTotal.WithLabelValues(phase, "error").Inc()
 			return ctrl.Result{}, fmt.Errorf("initializing status: %w", err)
 		}
 	}
@@ -90,12 +111,18 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	// 4. Check TTL Expiration
 	now := time.Now()
 	if IsExpired(sandbox, now) {
-		log.Info("Sandbox TTL expired, tearing down child resources", "sandbox", sandbox.Name)
-		return r.handleExpiration(ctx, sandbox)
+		log.Info("Sandbox TTL expired, tearing down child resources", "sandbox_name", sandbox.Name, "tier", string(sandbox.Spec.ResourceTier))
+		if err := r.handleExpiration(ctx, sandbox); err != nil {
+			metrics.SandboxReconcileTotal.WithLabelValues(phase, "error").Inc()
+			return ctrl.Result{}, err
+		}
+		metrics.SandboxReconcileTotal.WithLabelValues(phase, "success").Inc()
+		return ctrl.Result{}, nil
 	}
 
 	// 5. If already in Expired phase, do not reprovision child resources
 	if sandbox.Status.Phase == platformv1alpha1.SandboxPhaseExpired {
+		metrics.SandboxReconcileTotal.WithLabelValues(phase, "success").Inc()
 		return ctrl.Result{}, nil
 	}
 
@@ -109,6 +136,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.reconcileNamespace(ctx, sandbox); err != nil {
 		r.setCondition(sandbox, platformv1alpha1.ConditionTypeNamespaceReady, metav1.ConditionFalse, "NamespaceReconcileFailed", err.Error())
 		_ = r.updateStatus(ctx, sandbox)
+		metrics.SandboxReconcileTotal.WithLabelValues(phase, "error").Inc()
 		return ctrl.Result{}, fmt.Errorf("reconciling namespace: %w", err)
 	}
 	r.setCondition(sandbox, platformv1alpha1.ConditionTypeNamespaceReady, metav1.ConditionTrue, "NamespaceProvisioned", "Dedicated namespace exists and is labeled")
@@ -117,6 +145,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.reconcileResourceQuota(ctx, sandbox); err != nil {
 		r.setCondition(sandbox, platformv1alpha1.ConditionTypeResourcesReady, metav1.ConditionFalse, "QuotaReconcileFailed", err.Error())
 		_ = r.updateStatus(ctx, sandbox)
+		metrics.SandboxReconcileTotal.WithLabelValues(phase, "error").Inc()
 		return ctrl.Result{}, fmt.Errorf("reconciling resource quota: %w", err)
 	}
 
@@ -124,6 +153,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.reconcileLimitRange(ctx, sandbox); err != nil {
 		r.setCondition(sandbox, platformv1alpha1.ConditionTypeResourcesReady, metav1.ConditionFalse, "LimitRangeReconcileFailed", err.Error())
 		_ = r.updateStatus(ctx, sandbox)
+		metrics.SandboxReconcileTotal.WithLabelValues(phase, "error").Inc()
 		return ctrl.Result{}, fmt.Errorf("reconciling limit range: %w", err)
 	}
 	r.setCondition(sandbox, platformv1alpha1.ConditionTypeResourcesReady, metav1.ConditionTrue, "ResourcesEnforced", "ResourceQuota and LimitRange configured")
@@ -132,6 +162,7 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	if err := r.reconcileNetworkPolicy(ctx, sandbox); err != nil {
 		r.setCondition(sandbox, platformv1alpha1.ConditionTypeNetworkReady, metav1.ConditionFalse, "NetworkPolicyReconcileFailed", err.Error())
 		_ = r.updateStatus(ctx, sandbox)
+		metrics.SandboxReconcileTotal.WithLabelValues(phase, "error").Inc()
 		return ctrl.Result{}, fmt.Errorf("reconciling network policy: %w", err)
 	}
 	if sandbox.Spec.NetworkIsolation {
@@ -146,21 +177,29 @@ func (r *SandboxReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ct
 	sandbox.Status.AllocatedNamespace = nsName
 
 	if err := r.updateStatus(ctx, sandbox); err != nil {
-		log.Error(err, "Failed to update Sandbox status")
+		log.Error(err, "Failed to update Sandbox status", "sandbox_name", sandbox.Name)
+		metrics.SandboxReconcileTotal.WithLabelValues(phase, "error").Inc()
 		return ctrl.Result{}, err
 	}
+
+	metrics.SandboxesActive.WithLabelValues(string(sandbox.Spec.ResourceTier), string(sandbox.Status.Phase)).Set(1)
+	metrics.SandboxReconcileTotal.WithLabelValues(string(sandbox.Status.Phase), "success").Inc()
 
 	// 11. Schedule Requeue for remaining TTL
 	remaining := RemainingTTL(sandbox, time.Now())
 	return ctrl.Result{RequeueAfter: remaining}, nil
 }
 
-func (r *SandboxReconciler) handleExpiration(ctx context.Context, sandbox *platformv1alpha1.Sandbox) (ctrl.Result, error) {
+func (r *SandboxReconciler) handleExpiration(ctx context.Context, sandbox *platformv1alpha1.Sandbox) error {
 	log := logf.FromContext(ctx)
 
 	r.setCondition(sandbox, platformv1alpha1.ConditionTypeExpired, metav1.ConditionTrue, "TTLExpired", "Sandbox TTL has expired and child resources are cleaned up")
 	r.setCondition(sandbox, platformv1alpha1.ConditionTypeReady, metav1.ConditionFalse, "SandboxExpired", "Sandbox environment is expired")
 	sandbox.Status.Phase = platformv1alpha1.SandboxPhaseExpired
+
+	metrics.SandboxTTLExpiredTotal.Inc()
+	metrics.SandboxesActive.WithLabelValues(string(sandbox.Spec.ResourceTier), string(platformv1alpha1.SandboxPhaseReady)).Set(0)
+	metrics.SandboxesActive.WithLabelValues(string(sandbox.Spec.ResourceTier), string(platformv1alpha1.SandboxPhaseExpired)).Set(1)
 
 	nsName := NamespaceName(sandbox)
 	ns := &corev1.Namespace{}
@@ -168,19 +207,19 @@ func (r *SandboxReconciler) handleExpiration(ctx context.Context, sandbox *platf
 	if err == nil {
 		if ns.DeletionTimestamp.IsZero() {
 			if err := r.Delete(ctx, ns); err != nil && !apierrors.IsNotFound(err) {
-				return ctrl.Result{}, fmt.Errorf("deleting expired child namespace %s: %w", nsName, err)
+				return fmt.Errorf("deleting expired child namespace %s: %w", nsName, err)
 			}
 			log.Info("Deleted child namespace for expired sandbox", "sandbox", sandbox.Name, "namespace", nsName)
 		}
 	} else if !apierrors.IsNotFound(err) {
-		return ctrl.Result{}, fmt.Errorf("fetching child namespace %s: %w", nsName, err)
+		return fmt.Errorf("fetching child namespace %s: %w", nsName, err)
 	}
 
 	if err := r.updateStatus(ctx, sandbox); err != nil {
-		return ctrl.Result{}, fmt.Errorf("updating expired sandbox status: %w", err)
+		return fmt.Errorf("updating expired sandbox status: %w", err)
 	}
 
-	return ctrl.Result{}, nil
+	return nil
 }
 
 func (r *SandboxReconciler) reconcileNamespace(ctx context.Context, sandbox *platformv1alpha1.Sandbox) error {
@@ -219,6 +258,7 @@ func (r *SandboxReconciler) reconcileResourceQuota(ctx context.Context, sandbox 
 	existing := &corev1.ResourceQuota{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: desired.Namespace, Name: desired.Name}, existing)
 	if apierrors.IsNotFound(err) {
+		metrics.SandboxDriftHealedTotal.WithLabelValues("ResourceQuota").Inc()
 		return r.Create(ctx, desired)
 	}
 	if err != nil {
@@ -234,6 +274,7 @@ func (r *SandboxReconciler) reconcileLimitRange(ctx context.Context, sandbox *pl
 	existing := &corev1.LimitRange{}
 	err := r.Get(ctx, client.ObjectKey{Namespace: desired.Namespace, Name: desired.Name}, existing)
 	if apierrors.IsNotFound(err) {
+		metrics.SandboxDriftHealedTotal.WithLabelValues("LimitRange").Inc()
 		return r.Create(ctx, desired)
 	}
 	if err != nil {
@@ -260,6 +301,7 @@ func (r *SandboxReconciler) reconcileNetworkPolicy(ctx context.Context, sandbox 
 	}
 
 	if apierrors.IsNotFound(err) {
+		metrics.SandboxDriftHealedTotal.WithLabelValues("NetworkPolicy").Inc()
 		return r.Create(ctx, desired)
 	}
 	if err != nil {
