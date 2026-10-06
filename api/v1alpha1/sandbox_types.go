@@ -70,7 +70,7 @@ type SandboxSpec struct {
 	// When true, only DNS and intra-namespace traffic are allowed.
 	// +kubebuilder:default=true
 	// +optional
-	NetworkIsolation bool `json:"networkIsolation,omitempty"`
+	NetworkIsolation bool `json:"networkIsolation"`
 }
 
 // SandboxStatus defines the observed state of Sandbox.
