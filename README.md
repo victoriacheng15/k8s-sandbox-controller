@@ -1,118 +1,77 @@
 # k8s-sandbox-controller
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+k8s-sandbox-controller is an automated Kubernetes operator built with Go, Kubebuilder, and controller-runtime that provisions ephemeral developer sandbox environments with multi-tenant isolation, deterministic resource quotas, in-tree CEL admission security, self-cleaning TTL lifecycles, and native Prometheus observability.
 
-## Getting Started
+## Architecture
 
-### Prerequisites
-- go version v1.26.0+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+The operator manages the full sandbox lifecycle across five operational stages:
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+| Path | Purpose | Flow |
+| :--- | :--- | :--- |
+| **CRD Ingestion** | Declare sandbox specs with CEL validation rules | Developer -> kubectl -> Sandbox CR |
+| **Hermetic Isolation** | Provision child namespace, quotas, limits, and network policies | Controller -> Namespace, Quota, LimitRange, NetPol |
+| **In-Tree Admission** | Enforce non-root execution and trusted registries without webhooks | ValidatingAdmissionPolicy (CEL) -> API Server |
+| **Drift Healing & TTL** | Heal out-of-band tampering and execute ordered finalizer teardown | Watches -> Reconciler -> Namespace Teardown |
+| **Observability** | Export reconciliation duration, status, and drift metrics | Controller Manager -> Prometheus (`:8443/metrics`) |
 
-```sh
-make docker-build docker-push IMG=<some-registry>/k8s-sandbox-controller:tag
-```
+![k8s-sandbox-controller Architecture](docs/assets/architecture.png)
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+## Service Level Objectives (SLOs) & Reliability
 
-**Install the CRDs into the cluster:**
+Controller reliability and reconciliation performance standards are monitored via Prometheus metrics:
 
-```sh
+| Objective (SLO) | Indicator (SLI) | Alert Trigger |
+| :--- | :--- | :--- |
+| **100% Reconcile Convergence** | Reconciliation error rate | `rate(sandbox_reconcile_total{status="error"}[5m]) > 0` |
+| **< 500ms Reconcile Latency** | Reconciliation loop p99 duration | `histogram_quantile(0.99, sum(rate(sandbox_reconcile_duration_seconds_bucket[5m])) by (le)) > 0.5` |
+| **Zero Lingering Sandboxes** | TTL expired teardown count | `sandbox_ttl_expired_total > 0` (unresolved after TTL) |
+| **100% Drift Self-Healing** | Drift correction event rate | `rate(sandbox_drift_healed_total[5m]) > 0` |
+| **High Availability Controller** | Manager pod readiness probe | `up{job="k8s-sandbox-controller-manager"} == 0` |
+
+## Tech Stack
+
+| Layer | Tools |
+| :--- | :--- |
+| **Language & Framework** | Go 1.22+, Kubebuilder, controller-runtime |
+| **API & Policy** | CustomResourceDefinition (`platform.sandbox.dev/v1alpha1`), CEL ValidatingAdmissionPolicy |
+| **Network & Security** | Kubernetes NetworkPolicy (Default-Deny Ingress/Egress) |
+| **Observability** | Prometheus Metrics, controller-runtime registry, zapr |
+| **Testing & Quality** | Ginkgo, Gomega, Godog (BDD E2E), envtest, golangci-lint |
+| **Packaging** | Kustomize, Docker, Make |
+
+## Key Architectural Decisions
+
+- **In-Tree CEL Over Webhooks:** Uses `ValidatingAdmissionPolicy` instead of mutating/validating webhooks to eliminate certificate rotation, webhook network hops, and failure-open risks.
+- **Dedicated Namespace Boundaries:** Each sandbox isolates workloads inside a dedicated `sbx-<name>` child namespace with scoped `ResourceQuota`, `LimitRange`, and default-deny `NetworkPolicy`.
+- **Level-Triggered Drift Self-Healing:** Secondary watches on child resources automatically enqueue the parent `Sandbox` upon out-of-band changes, guaranteeing convergence to desired state.
+- **Ordered Teardown with Safe Finalizers:** Retains `finalizers.sandbox.dev/cleanup` until the child namespace is fully purged from etcd, preventing orphan resources upon TTL expiration.
+
+## Documentation
+
+- [System Architecture](docs/architecture.md)
+- [Operational Runbook](docs/operational-runbook.md)
+
+## Local Development
+
+Run the operator locally against a development cluster (Kind, Minikube, or k3s):
+
+```bash
+# Install CRDs and CEL admission policies
 make install
+kubectl apply -k config/admission
+
+# Run controller locally
+make run
+
+# In another terminal, apply a sample Sandbox
+kubectl apply -f config/samples/platform_v1alpha1_sandbox.yaml
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+## Quality Verification & Linting
 
-```sh
-make deploy IMG=<some-registry>/k8s-sandbox-controller:tag
+```bash
+make lint           # Run golangci-lint and style verification
+make test           # Run unit tests and hermetic envtest suite
+make test-e2e       # Run Godog BDD end-to-end tests
+make manifests      # Regenerate CRDs and RBAC manifests
 ```
-
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/k8s-sandbox-controller:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/k8s-sandbox-controller/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
