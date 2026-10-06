@@ -75,6 +75,9 @@ var _ = BeforeSuite(func() {
 		testEnv.BinaryAssetsDirectory = getFirstFoundEnvTestBinaryDir()
 	}
 
+	testEnv.ControlPlane.GetAPIServer().Configure().
+		Append("enable-admission-plugins", "ValidatingAdmissionPolicy")
+
 	// cfg is defined in this file globally.
 	cfg, err = testEnv.Start()
 	Expect(err).NotTo(HaveOccurred())

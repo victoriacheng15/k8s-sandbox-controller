@@ -18,12 +18,15 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"time"
 
+	admissionregistrationv1 "k8s.io/api/admissionregistration/v1"
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -86,7 +89,7 @@ var _ = Describe("Sandbox Controller", func() {
 			nsName := NamespaceName(sandbox)
 			ns := &corev1.Namespace{}
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: nsName}, ns)).To(Succeed())
-			Expect(ns.Labels).To(HaveKeyWithValue(LabelManaged, "true"))
+			Expect(ns.Labels).To(HaveKeyWithValue(LabelManaged, LabelManagedValue))
 			Expect(ns.Labels).To(HaveKeyWithValue(LabelSandboxName, sandbox.Name))
 
 			// Verify child ResourceQuota
@@ -194,7 +197,7 @@ var _ = Describe("Sandbox Controller", func() {
 
 			restored := &corev1.Namespace{}
 			Expect(k8sClient.Get(ctx, client.ObjectKey{Name: nsName}, restored)).To(Succeed())
-			Expect(restored.Labels).To(HaveKeyWithValue(LabelManaged, "true"))
+			Expect(restored.Labels).To(HaveKeyWithValue(LabelManaged, LabelManagedValue))
 		})
 	})
 
@@ -394,6 +397,268 @@ var _ = Describe("Sandbox Controller", func() {
 			goneCR := &platformv1alpha1.Sandbox{}
 			errGone = k8sClient.Get(ctx, reqGone.NamespacedName, goneCR)
 			Expect(apierrors.IsNotFound(errGone)).To(BeTrue())
+		})
+	})
+
+	Context("Declarative Admission & Security Policies (CEL)", func() {
+		const (
+			testContainerName = "app"
+			dropCapabilityAll = corev1.Capability("ALL")
+		)
+
+		var (
+			managedNs   string
+			unmanagedNs string
+		)
+
+		BeforeEach(func() {
+			managedNs = "sbx-admission-test"
+			unmanagedNs = "unmanaged-admission-test"
+
+			// Create managed namespace
+			nsManaged := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: managedNs,
+					Labels: map[string]string{
+						LabelManaged: LabelManagedValue,
+					},
+				},
+			}
+			_ = k8sClient.Create(ctx, nsManaged)
+
+			// Create unmanaged namespace
+			nsUnmanaged := &corev1.Namespace{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: unmanagedNs,
+				},
+			}
+			_ = k8sClient.Create(ctx, nsUnmanaged)
+
+			failPolicy := admissionregistrationv1.Fail
+			policy := &admissionregistrationv1.ValidatingAdmissionPolicy{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "sandbox-workload-security",
+				},
+				Spec: admissionregistrationv1.ValidatingAdmissionPolicySpec{
+					FailurePolicy: &failPolicy,
+					MatchConstraints: &admissionregistrationv1.MatchResources{
+						ResourceRules: []admissionregistrationv1.NamedRuleWithOperations{
+							{
+								RuleWithOperations: admissionregistrationv1.RuleWithOperations{
+									Operations: []admissionregistrationv1.OperationType{
+										admissionregistrationv1.Create,
+										admissionregistrationv1.Update,
+									},
+									Rule: admissionregistrationv1.Rule{
+										APIGroups:   []string{""},
+										APIVersions: []string{"v1"},
+										Resources:   []string{"pods"},
+									},
+								},
+							},
+						},
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								LabelManaged: LabelManagedValue,
+							},
+						},
+					},
+					Validations: []admissionregistrationv1.Validation{
+						{
+							Expression: "object.spec.containers.all(c, !c.image.endsWith(':latest') && (c.image.contains(':') || c.image.contains('@')))",
+							Message:    "Container image must not use the :latest tag and must specify an explicit tag or digest",
+						},
+						{
+							Expression: "object.spec.containers.all(c, !c.image.contains('/') || [ 'docker.io', 'ghcr.io', 'quay.io', 'registry.k8s.io', 'gcr.io' ].exists(reg, c.image.startsWith(reg + '/')))",
+							Message:    "Container image must be pulled from an approved registry (docker.io, ghcr.io, quay.io, registry.k8s.io, gcr.io, or library)",
+						},
+						{
+							Expression: "object.spec.containers.all(c, has(c.resources) && has(c.resources.requests) && has(c.resources.requests.cpu) && has(c.resources.requests.memory) && has(c.resources.limits) && has(c.resources.limits.cpu) && has(c.resources.limits.memory))",
+							Message:    "Containers must specify explicit CPU and memory requests and limits",
+						},
+						{
+							Expression: "(has(object.spec.securityContext) && object.spec.securityContext.runAsNonRoot == true) || object.spec.containers.all(c, has(c.securityContext) && c.securityContext.runAsNonRoot == true)",
+							Message:    "Pods or containers must configure runAsNonRoot: true",
+						},
+						{
+							Expression: "object.spec.containers.all(c, has(c.securityContext) && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && c.securityContext.capabilities.drop.exists(cap, cap == 'ALL'))",
+							Message:    "Containers must drop ALL capabilities (securityContext.capabilities.drop must include 'ALL')",
+						},
+					},
+				},
+			}
+			err := k8sClient.Create(ctx, policy)
+			if err != nil && !apierrors.IsAlreadyExists(err) {
+				Expect(err).NotTo(HaveOccurred())
+			}
+
+			binding := &admissionregistrationv1.ValidatingAdmissionPolicyBinding{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: "sandbox-workload-security-binding",
+				},
+				Spec: admissionregistrationv1.ValidatingAdmissionPolicyBindingSpec{
+					PolicyName: "sandbox-workload-security",
+					ValidationActions: []admissionregistrationv1.ValidationAction{
+						admissionregistrationv1.Deny,
+					},
+					MatchResources: &admissionregistrationv1.MatchResources{
+						NamespaceSelector: &metav1.LabelSelector{
+							MatchLabels: map[string]string{
+								LabelManaged: LabelManagedValue,
+							},
+						},
+					},
+				},
+			}
+			err = k8sClient.Create(ctx, binding)
+			if err != nil && !apierrors.IsAlreadyExists(err) {
+				Expect(err).NotTo(HaveOccurred())
+			}
+		})
+
+		It("should reject pods with :latest image tag in managed namespaces", func() {
+			nonRoot := true
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-reject-latest",
+					Namespace: managedNs,
+				},
+				Spec: corev1.PodSpec{
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: &nonRoot,
+					},
+					Containers: []corev1.Container{
+						{
+							Name:  testContainerName,
+							Image: "nginx:latest",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("64Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{dropCapabilityAll},
+								},
+							},
+						},
+					},
+				},
+			}
+			Eventually(func() string {
+				p := pod.DeepCopy()
+				p.Name = fmt.Sprintf("test-reject-latest-%d", time.Now().UnixNano())
+				err := k8sClient.Create(ctx, p)
+				if err != nil {
+					return err.Error()
+				}
+				return ""
+			}, 5*time.Second, 200*time.Millisecond).Should(ContainSubstring("Container image must not use the :latest tag"))
+		})
+
+		It("should reject pods with unauthorized registry in managed namespaces", func() {
+			nonRoot := true
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-reject-registry",
+					Namespace: managedNs,
+				},
+				Spec: corev1.PodSpec{
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: &nonRoot,
+					},
+					Containers: []corev1.Container{
+						{
+							Name:  testContainerName,
+							Image: "untrusted.registry.io/app:1.0.0",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("64Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{dropCapabilityAll},
+								},
+							},
+						},
+					},
+				},
+			}
+			Eventually(func() string {
+				p := pod.DeepCopy()
+				p.Name = fmt.Sprintf("test-reject-registry-%d", time.Now().UnixNano())
+				err := k8sClient.Create(ctx, p)
+				if err != nil {
+					return err.Error()
+				}
+				return ""
+			}, 5*time.Second, 200*time.Millisecond).Should(ContainSubstring("Container image must be pulled from an approved registry"))
+		})
+
+		It("should allow compliant pods in managed namespaces", func() {
+			nonRoot := true
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-allow-compliant",
+					Namespace: managedNs,
+				},
+				Spec: corev1.PodSpec{
+					SecurityContext: &corev1.PodSecurityContext{
+						RunAsNonRoot: &nonRoot,
+					},
+					Containers: []corev1.Container{
+						{
+							Name:  testContainerName,
+							Image: "nginx:1.27.1-alpine",
+							Resources: corev1.ResourceRequirements{
+								Requests: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("100m"),
+									corev1.ResourceMemory: resource.MustParse("64Mi"),
+								},
+								Limits: corev1.ResourceList{
+									corev1.ResourceCPU:    resource.MustParse("200m"),
+									corev1.ResourceMemory: resource.MustParse("128Mi"),
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Capabilities: &corev1.Capabilities{
+									Drop: []corev1.Capability{dropCapabilityAll},
+								},
+							},
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+		})
+
+		It("should bypass unmanaged namespaces without enforcing policy (blast radius mitigation)", func() {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-allow-unmanaged",
+					Namespace: unmanagedNs,
+				},
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{
+						{
+							Name:  testContainerName,
+							Image: "nginx:latest",
+						},
+					},
+				},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
 		})
 	})
 })

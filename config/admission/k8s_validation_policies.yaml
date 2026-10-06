@@ -1,0 +1,31 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: sandbox-workload-security
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups: [""]
+      apiVersions: ["v1"]
+      operations: ["CREATE", "UPDATE"]
+      resources: ["pods"]
+    namespaceSelector:
+      matchLabels:
+        sandbox.dev/managed: "true"
+  validations:
+    - expression: "object.spec.containers.all(c, !c.image.endsWith(':latest') && (c.image.contains(':') || c.image.contains('@')))"
+      message: "Container image must not use the :latest tag and must specify an explicit tag or digest"
+      reason: Forbidden
+    - expression: "object.spec.containers.all(c, !c.image.contains('/') || [ 'docker.io', 'ghcr.io', 'quay.io', 'registry.k8s.io', 'gcr.io' ].exists(reg, c.image.startsWith(reg + '/')))"
+      message: "Container image must be pulled from an approved registry (docker.io, ghcr.io, quay.io, registry.k8s.io, gcr.io, or library)"
+      reason: Forbidden
+    - expression: "object.spec.containers.all(c, has(c.resources) && has(c.resources.requests) && has(c.resources.requests.cpu) && has(c.resources.requests.memory) && has(c.resources.limits) && has(c.resources.limits.cpu) && has(c.resources.limits.memory))"
+      message: "Containers must specify explicit CPU and memory requests and limits"
+      reason: Forbidden
+    - expression: "(has(object.spec.securityContext) && object.spec.securityContext.runAsNonRoot == true) || object.spec.containers.all(c, has(c.securityContext) && c.securityContext.runAsNonRoot == true)"
+      message: "Pods or containers must configure runAsNonRoot: true"
+      reason: Forbidden
+    - expression: "object.spec.containers.all(c, has(c.securityContext) && has(c.securityContext.capabilities) && has(c.securityContext.capabilities.drop) && c.securityContext.capabilities.drop.exists(cap, cap == 'ALL'))"
+      message: "Containers must drop ALL capabilities (securityContext.capabilities.drop must include 'ALL')"
+      reason: Forbidden
